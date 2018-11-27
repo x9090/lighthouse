@@ -4,6 +4,7 @@ import os
 import sys
 import mmap
 import struct
+import re
 from ctypes import *
 
 #------------------------------------------------------------------------------
@@ -87,7 +88,7 @@ class DrcovData(object):
 
         # if we fail to find a module that matches the given name, bail
         if not module:
-            raise ValueError("Failed to find module '%s' in coverage data" % module_name)
+            raise ValueError("No coverage for module '%s' in log" % module_name)
 
         # extract module id for speed
         mod_id = module.id
@@ -115,7 +116,7 @@ class DrcovData(object):
         """
         Parse drcov coverage from the given data blob.
         """
-        pass # TODO
+        pass # TODO/DRCOV
 
     #--------------------------------------------------------------------------
     # Parsing Routines - Internals
@@ -156,7 +157,7 @@ class DrcovData(object):
            eg: 'Module Table: 11'
 
         Format used in DynamoRIO v7.0.0-RC1 (and hopefully above)
-           eg: 'Module Table: version 2, count 11'
+           eg: 'Module Table: version X, count 11'
 
         """
 
@@ -191,6 +192,8 @@ class DrcovData(object):
         data_name, version = version_data.split(" ")
         #assert data_name == "version"
         self.module_table_version = int(version)
+        if not self.module_table_version in [2, 3, 4]:
+            raise ValueError("Unsupported (new?) drcov log format...")
 
         # parse module count in table from 'count Y'
         data_name, count = count_data.split(" ")
@@ -203,14 +206,26 @@ class DrcovData(object):
 
         -------------------------------------------------------------------
 
-        Format used in DynamoRIO v6.1.1 through 6.2.0
+        DynamoRIO v6.1.1, table version 1:
            eg: (Not present)
 
-        Format used in DynamoRIO v7.0.0-RC1 (and hopefully above)
+        DynamoRIO v7.0.0-RC1, table version 2:
            Windows:
              'Columns: id, base, end, entry, checksum, timestamp, path'
            Mac/Linux:
              'Columns: id, base, end, entry, path'
+
+        DynamoRIO v7.0.17594B, table version 3:
+           Windows:
+             'Columns: id, containing_id, start, end, entry, checksum, timestamp, path'
+           Mac/Linux:
+             'Columns: id, containing_id, start, end, entry, path'
+
+        DynamoRIO v7.0.17640, table version 4:
+           Windows:
+             'Columns: id, containing_id, start, end, entry, offset, checksum, timestamp, path'
+           Mac/Linux:
+             'Columns: id, containing_id, start, end, entry, offset, path'
 
         """
 
@@ -270,23 +285,42 @@ class DrcovData(object):
         # is this an ascii table?
         if f.read(len(token)) == token:
             self.bb_table_is_binary = False
-            raise ValueError("ASCII DrCov logs are not supported at this time.")
 
-        # nope! binary table, seek back to the start of the table
+        # nope! binary table
         else:
             self.bb_table_is_binary = True
-            f.seek(saved_position)
+
+        # seek back to the start of the table
+        f.seek(saved_position)
 
     def _parse_bb_table_entries(self, f):
         """
         Parse drcov log basic block table entries from filestream.
         """
-
         # allocate the ctypes structure array of basic blocks
         self.basic_blocks = (DrcovBasicBlock * self.bb_table_count)()
 
-        # read the basic block entries directly into the newly allocated array
-        f.readinto(self.basic_blocks)
+        if self.bb_table_is_binary:
+            # read the basic block entries directly into the newly allocated array
+            f.readinto(self.basic_blocks)
+
+        else:  # let's parse the text records
+            text_entry = f.readline().strip()
+
+            if text_entry != "module id, start, size:":
+                raise ValueError("Invalid BB header: %r" % text_entry)
+
+            pattern = re.compile(r"^module\[\s*(?P<mod>[0-9]+)\]\:\s*(?P<start>0x[0-9a-f]+)\,\s*(?P<size>[0-9]+)$")
+            for basic_block in self.basic_blocks:
+                text_entry = f.readline().strip()
+
+                match = pattern.match(text_entry)
+                if not match:
+                    raise ValueError("Invalid BB entry: %r" % text_entry)
+
+                basic_block.start = int(match.group("start"), 16)
+                basic_block.size = int(match.group("size"), 10)
+                basic_block.mod_id = int(match.group("mod"), 10)
 
 #------------------------------------------------------------------------------
 # drcov module parser
@@ -308,9 +342,19 @@ class DrcovModule(object):
         self.timestamp = 0
         self.path      = ""
         self.filename  = ""
+        self.containing_id = 0
 
         # parse the module
         self._parse_module(module_data, version)
+
+    @property
+    def start(self):
+        """
+        Compatability alias for the module base.
+
+        DrCov table version 2 --> 3 changed this paramter name base --> start.
+        """
+        return self.base
 
     def _parse_module(self, module_line, version):
         """
@@ -323,6 +367,10 @@ class DrcovModule(object):
             self._parse_module_v1(data)
         elif version == 2:
             self._parse_module_v2(data)
+        elif version == 3:
+            self._parse_module_v3(data)
+        elif version == 4:
+            self._parse_module_v4(data)
         else:
             raise ValueError("Unknown module format (v%u)" % version)
 
@@ -349,6 +397,39 @@ class DrcovModule(object):
         self.path      = str(data[-1])
         self.size      = self.end-self.base
         self.filename  = os.path.basename(self.path)
+
+    def _parse_module_v3(self, data):
+        """
+        Parse a module table v3 entry.
+        """
+        self.id            = int(data[0])
+        self.containing_id = int(data[1])
+        self.base          = int(data[2], 16)
+        self.end           = int(data[3], 16)
+        self.entry         = int(data[4], 16)
+        if len(data) == 7: # Windows Only
+            self.checksum  = int(data[5], 16)
+            self.timestamp = int(data[6], 16)
+        self.path          = str(data[-1])
+        self.size          = self.end-self.base
+        self.filename      = os.path.basename(self.path)
+
+    def _parse_module_v4(self, data):
+        """
+        Parse a module table v4 entry.
+        """
+        self.id            = int(data[0])
+        self.containing_id = int(data[1])
+        self.base          = int(data[2], 16)
+        self.end           = int(data[3], 16)
+        self.entry         = int(data[4], 16)
+        self.offset        = int(data[5], 16)
+        if len(data) == 9: # Windows Only
+            self.checksum  = int(data[6], 16)
+            self.timestamp = int(data[7], 16)
+        self.path          = str(data[-1])
+        self.size          = self.end-self.base
+        self.filename      = os.path.basename(self.path)
 
 #------------------------------------------------------------------------------
 # drcov basic block parser
