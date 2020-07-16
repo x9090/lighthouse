@@ -1,3 +1,4 @@
+using namespace std;
 #include <iostream>
 #include <set>
 #include <string>
@@ -25,32 +26,29 @@ using unordered_map = std::tr1::unordered_map<K, V>;
 }
 
 // Tool's arguments.
-static KNOB<string> KnobModuleWhitelist(KNOB_MODE_APPEND, "pintool", "w", "",
+static KNOB<std::string> KnobModuleWhitelist(KNOB_MODE_APPEND, "pintool", "w", "",
     "Add a module to the white list. If none is specified, everymodule is white-listed. Example: libTIFF.dylib");
 
-static KNOB<string> KnobLogFile(KNOB_MODE_WRITEONCE, "pintool", "l", "trace.log",
+static KNOB<std::string> KnobLogFile(KNOB_MODE_WRITEONCE, "pintool", "l", "trace.log",
     "Name of the output file. If none is specified, trace.log is used.");
 
 // Return the file/directory name of a path.
-static string base_name(const string& path)
+static std::string base_name(const std::string& path)
 {
 #if defined(TARGET_WINDOWS)
 #define PATH_SEPARATOR "\\"
 #else
 #define PATH_SEPARATOR "/"
 #endif
-    string::size_type idx = path.rfind(PATH_SEPARATOR);
-    string name = (idx == string::npos) ? path : path.substr(idx + 1);
+    std::string::size_type idx = path.rfind(PATH_SEPARATOR);
+    std::string name = (idx == std::string::npos) ? path : path.substr(idx + 1);
     return name;
 }
 
 // Per thread data structure. This is mainly done to avoid locking.
+// - Per-thread map of executed basic blocks, and their size.
 struct ThreadData {
-    // Unique list of hit basic blocks.
-    pintool::unordered_set<ADDRINT> m_block_hit;
-
-    // Map basic a block address to its size.
-    pintool::unordered_map<ADDRINT, uint16_t> m_block_size;
+    pintool::unordered_map<ADDRINT, uint16_t> m_blocks;
 };
 
 class ToolContext {
@@ -129,7 +127,7 @@ static VOID OnThreadFini(THREADID tid, const CONTEXT* ctxt, INT32 c, VOID* v)
 static VOID OnImageLoad(IMG img, VOID* v)
 {
     auto& context = *reinterpret_cast<ToolContext*>(v);
-    string img_name = base_name(IMG_Name(img));
+    std::string img_name = base_name(IMG_Name(img));
 
     ADDRINT low = IMG_LowAddress(img);
     ADDRINT high = IMG_HighAddress(img);
@@ -165,24 +163,37 @@ static VOID PIN_FAST_ANALYSIS_CALL OnBasicBlockHit(THREADID tid, ADDRINT addr, U
 {
     auto& context = *reinterpret_cast<ToolContext*>(v);
     ThreadData* data = context.GetThreadLocalData(tid);
-    data->m_block_hit.insert(addr);
-    data->m_block_size[addr] = size;
+    data->m_blocks[addr] = size;
+    PIN_RemoveInstrumentationInRange(addr, addr);
 }
 
 // Trace hit event handler.
 static VOID OnTrace(TRACE trace, VOID* v)
 {
     auto& context = *reinterpret_cast<ToolContext*>(v);
-    BBL bbl = TRACE_BblHead(trace);
-    ADDRINT addr = BBL_Address(bbl);
 
     // Check if the address is inside a white-listed image.
-    if (!context.m_tracing_enabled || !context.m_images->isInterestingAddress(addr))
+    if (!context.m_tracing_enabled || !context.m_images->isInterestingAddress(TRACE_Address(trace)))
         return;
 
-    // For each basic block in the trace.
-    for (; BBL_Valid(bbl); bbl = BBL_Next(bbl)) {
-        addr = BBL_Address(bbl);
+    auto tid = PIN_ThreadId();
+    ThreadData* data = context.GetThreadLocalData(tid);
+
+    // This trace is getting JIT'd, which implies the head must get executed.
+    auto bbl = TRACE_BblHead(trace);
+    auto addr = BBL_Address(bbl);
+    data->m_blocks[addr] = (uint16_t)BBL_Size(bbl);
+
+    // For each basic block in the trace...
+    for (bbl = BBL_Next(bbl); BBL_Valid(bbl); bbl = BBL_Next(bbl))
+    {
+
+        // Ignore blocks that have already been marked as executed in the past...
+        ADDRINT addr = BBL_Address(bbl);
+        if (data->m_blocks.find(addr) != data->m_blocks.end())
+            continue;
+
+        // Instrument blocks that have not yet been executed (at least... by this thread).
         BBL_InsertCall(bbl, IPOINT_ANYWHERE, (AFUNPTR)OnBasicBlockHit,
             IARG_FAST_ANALYSIS_CALL,
             IARG_THREAD_ID,
@@ -191,6 +202,7 @@ static VOID OnTrace(TRACE trace, VOID* v)
             IARG_PTR, v,
             IARG_END);
     }
+
 }
 
 // Program finish event handler.
@@ -218,7 +230,7 @@ static VOID OnFini(INT32 code, VOID* v)
     // Count the global number of basic blocks.
     size_t number_of_bbs = 0;
     for (const auto& data : context.m_terminated_threads) {
-        number_of_bbs += data->m_block_hit.size();
+        number_of_bbs += data->m_blocks.size();
     }
 
     context.m_trace->write_string("BB Table: %u bbs\n", number_of_bbs);
@@ -232,7 +244,8 @@ static VOID OnFini(INT32 code, VOID* v)
     drcov_bb tmp;
 
     for (const auto& data : context.m_terminated_threads) {
-        for (const auto& address : data->m_block_hit) {
+        for (const auto& block : data->m_blocks) {
+            auto address = block.first;
             auto it = std::find_if(context.m_loaded_images.begin(), context.m_loaded_images.end(), [&address](const LoadedImage& image) {
                 return address >= image.low_ && address < image.high_;
             });
@@ -242,7 +255,7 @@ static VOID OnFini(INT32 code, VOID* v)
 
             tmp.id = (uint16_t)std::distance(context.m_loaded_images.begin(), it);
             tmp.start = (uint32_t)(address - it->low_);
-            tmp.size = data->m_block_size[address];
+            tmp.size = data->m_blocks[address];
 
             context.m_trace->write_binary(&tmp, sizeof(tmp));
         }
@@ -251,14 +264,14 @@ static VOID OnFini(INT32 code, VOID* v)
 
 int main(int argc, char* argv[])
 {
-    cout << "CodeCoverage tool by Agustin Gianni (agustingianni@gmail.com)" << endl;
+    std::cout << "CodeCoverage tool by Agustin Gianni (agustingianni@gmail.com)" << std::endl;
 
     // Initialize symbol processing
     PIN_InitSymbols();
 
     // Initialize PIN.
     if (PIN_Init(argc, argv)) {
-        cerr << "Error initializing PIN, PIN_Init failed!" << endl;
+        std::cerr << "Error initializing PIN, PIN_Init failed!" << std::endl;
         return -1;
     }
 
@@ -268,7 +281,7 @@ int main(int argc, char* argv[])
     // Create a an image manager that keeps track of the loaded/unloaded images.
     context->m_images = new ImageManager();
     for (unsigned i = 0; i < KnobModuleWhitelist.NumberOfValues(); ++i) {
-        cout << "White-listing image: " << KnobModuleWhitelist.Value(i) << endl;
+        std::cout << "White-listing image: " << KnobModuleWhitelist.Value(i) << std::endl;
         context->m_images->addWhiteListedImage(KnobModuleWhitelist.Value(i));
 
         // We will only enable tracing when any of the whitelisted images gets loaded.
@@ -276,7 +289,7 @@ int main(int argc, char* argv[])
     }
 
     // Create a trace file.
-    cout << "Logging code coverage information to: " << KnobLogFile.ValueString() << endl;
+    std::cout << "Logging code coverage information to: " << KnobLogFile.ValueString() << std::endl;
     context->m_trace = new TraceFile(KnobLogFile.ValueString());
 
     // Handlers for thread creation and destruction.
